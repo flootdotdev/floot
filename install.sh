@@ -123,20 +123,119 @@ mv -f "$binary" "${install_dir}/floot"
 # does not install from there.
 echo "installed floot ${version} to ${install_dir}/floot"
 
-case ":${PATH}:" in
-  *":${install_dir}:"*) ;;
-  *)
-    case "${SHELL:-}" in
-      */zsh) profile="~/.zshrc" ;;
-      */bash) profile="~/.bashrc" ;;
-      *) profile="~/.profile" ;;
-    esac
-    # The line is printed rather than appended: this script is usually read
-    # off a pipe into sh, and editing a shell profile nobody asked us to
-    # touch is not something to do sight unseen.
-    echo "${install_dir} is not on your PATH yet, add this line to ${profile}:"
-    echo "  export PATH=\"${install_dir}:\$PATH\""
+# --- put floot on PATH ---
+# One block in the profile of the user's shell, between two marker lines. A
+# rerun updates the block where it stands: lines already in it stay (the CLI
+# adds its own later, such as the FVM folder), and only the ones missing are
+# added before the closing marker. Printing the line instead left most people
+# at "command not found" on their very first floot command.
+block_start="# >>> added by floot >>>"
+block_end="# <<< added by floot <<<"
+
+case "${SHELL:-}" in
+  */zsh) profile="${ZDOTDIR:-$HOME}/.zshrc" ;;
+  */bash)
+    # Terminal.app opens a login shell, which reads .bash_profile and never
+    # .bashrc; most Linux terminals open the other kind.
+    if [ "$os" = "macos" ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
     ;;
+  */fish) profile="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/floot.fish" ;;
+  *) profile="$HOME/.profile" ;;
 esac
 
-echo "next: run floot login"
+case "${SHELL:-}" in
+  */fish) path_line="contains -- \"${install_dir}\" \$PATH; or set -gx PATH \"${install_dir}\" \$PATH" ;;
+  *) path_line="export PATH=\"${install_dir}:\$PATH\"" ;;
+esac
+
+# The CLI's tab completion for zsh registers through `compdef`, which only
+# exists once zsh's completion system is loaded, and a new Mac's zsh does not
+# load it. Loaded here, only when nothing else did, ahead of the completion
+# entry the CLI appends below this block on its first run.
+compinit_line=""
+case "${SHELL:-}" in
+  */zsh) compinit_line='if ! type compdef >/dev/null 2>&1; then autoload -Uz compinit && compinit -i; fi' ;;
+esac
+
+on_path="no"
+case ":${PATH}:" in
+  *":${install_dir}:"*) on_path="yes" ;;
+esac
+
+has_block="no"
+if [ -f "$profile" ] && grep -qxF "$block_start" "$profile"; then
+  has_block="yes"
+fi
+
+# Writes the new profile to $kept: the block's missing lines added before its
+# closing marker, or a whole block appended when there is none.
+build_profile() {
+  kept="${work_dir}/profile"
+  if [ "$has_block" = "yes" ]; then
+    awk -v start="$block_start" -v end="$block_end" -v one="$path_line" -v two="$compinit_line" '
+      $0 == start { inside = 1; has_one = 0; has_two = (two == "") }
+      inside && $0 == one { has_one = 1 }
+      inside && $0 == two { has_two = 1 }
+      inside && $0 == end {
+        if (!has_one) print one
+        if (!has_two) print two
+        inside = 0
+      }
+      { print }
+    ' "$profile" >"$kept" || return 1
+    return 0
+  fi
+  if [ -f "$profile" ]; then cat "$profile" >"$kept" || return 1; else : >"$kept"; fi
+  # A blank line before the block, unless the file is empty or ends in one.
+  if [ -s "$kept" ] && [ -n "$(tail -n 1 "$kept")" ]; then
+    echo >>"$kept"
+  fi
+  {
+    echo "$block_start"
+    echo "$path_line"
+    if [ -n "$compinit_line" ]; then echo "$compinit_line"; fi
+    echo "$block_end"
+  } >>"$kept"
+}
+
+# The profile written in place (cat, not mv), so a symlinked dotfile stays a
+# link. Prints nothing and fails when the profile cannot be written.
+write_profile() {
+  mkdir -p "$(dirname "$profile")" 2>/dev/null || return 1
+  cat "$kept" >"$profile" 2>/dev/null
+}
+
+by_hand() {
+  echo "could not write to ${profile}, add these lines to it yourself:"
+  echo "  ${path_line}"
+  if [ -n "$compinit_line" ]; then echo "  ${compinit_line}"; fi
+  echo "then open a new terminal and run floot login"
+}
+
+next_step() {
+  if [ "$on_path" = "yes" ]; then
+    echo "next: run floot login"
+  else
+    # A script read off a pipe cannot change the shell that started it.
+    echo "open a new terminal, then run floot login"
+  fi
+}
+
+if [ "$has_block" = "no" ] && [ "$on_path" = "yes" ]; then
+  # The user put the folder on PATH themselves; their setup is left alone.
+  next_step
+elif ! build_profile; then
+  by_hand
+elif [ -f "$profile" ] && cmp -s "$kept" "$profile"; then
+  # The block already carries every line.
+  next_step
+elif write_profile; then
+  if [ "$has_block" = "yes" ]; then
+    echo "updated the floot block in ${profile}"
+  else
+    echo "added ${install_dir} to your PATH in ${profile}"
+  fi
+  next_step
+else
+  by_hand
+fi
